@@ -1,0 +1,19 @@
+{
+  "params": {
+    "alpha": 0.5,
+    "restart_cost": 32.0,
+    "stop_cost": 32.0,
+    "team_cost": 4.0
+  },
+  "external_spell_f1": 0.5361508347230584,
+  "external_macro_f1": 0.8867354439074691,
+  "matches": [
+    "J03WMX",
+    "J03WN1",
+    "J03WOH",
+    "J03WOY",
+    "J03WPY",
+    "J03WQQ",
+    "J03WR9"
+  ]
+}
