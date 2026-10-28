@@ -26,6 +26,7 @@ import possession_metrics as pm  # noqa: E402
 from games import GAME, half_video_blocks, source_frames  # noqa: E402
 from src.decode import decode, to_labels  # noqa: E402
 from src.model import PossessionModel, frame_table  # noqa: E402
+from src.stack import stack_table  # noqa: E402
 from src.tracking import load_metrica  # noqa: E402
 
 # Params
@@ -60,8 +61,15 @@ def build_labels(use_broadcast=True):
         raise ValueError("feature table does not match the stored model; re-run "
                          "python -m tuning.run_external")
     with open(os.path.join(MODELS_DIR, "decoder.json")) as handle:
-        params = json.load(handle)["params"]
+        config = json.load(handle)
+    params = config["params"]
     p_dead, p_home = model.predict(table)
+    if config.get("stacked"):
+        stage_two = PossessionModel.load(os.path.join(MODELS_DIR, "stage_two_model.pkl"))
+        table2, names2 = stack_table(p_dead, p_home, table, names)
+        if names2 != stage_two.names:
+            raise ValueError("stage-two table does not match the stored model")
+        p_dead, p_home = stage_two.predict(table2)
     return to_labels(decode(p_dead, p_home, trk.half_blocks(), **params))
 
 

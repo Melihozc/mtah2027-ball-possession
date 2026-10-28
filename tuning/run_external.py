@@ -14,6 +14,7 @@ label. The public ground truth is never read here.
 """
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -29,7 +30,8 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "evaluation"))
 import possession_metrics as pm  # noqa: E402
 from src.decode import decode, to_labels  # noqa: E402
-from src.model import PossessionModel, frame_table  # noqa: E402
+from src.model import GBM_PARAMS, PossessionModel, frame_table  # noqa: E402
+from src.stack import stack_table  # noqa: E402
 from src.tracking import load_metrica, CACHE_DIR  # noqa: E402
 from tuning.degrade import degrade, noise_profile  # noqa: E402
 from tuning.fast_metric import spell_f1 as fast_spell_f1  # noqa: E402
@@ -88,11 +90,22 @@ def _grid_score(params):
     return float(np.mean(spells))
 
 
+def _code_version():
+    """Short hash of the code a feature table depends on, so an edit invalidates the cache."""
+    digest = hashlib.sha256()
+    for path in ("src/features.py", "src/context.py", "tuning/degrade.py", "tuning/idsse.py"):
+        with open(os.path.join(ROOT, path), "rb") as handle:
+            digest.update(handle.read().replace(b"\r\n", b"\n"))
+    return digest.hexdigest()[:10]
+
+
 def build_tables(profile):
     """Degraded feature tables and labels for every external match, cached."""
     tables, labels, blocks, baselines = [], [], [], []
+    version = _code_version()
     for index, match in enumerate(MATCHES):
-        cache = os.path.join(CACHE_DIR, "table_{}_degraded_s{}.npz".format(match, index))
+        cache = os.path.join(CACHE_DIR, "table_{}_degraded_s{}_{}.npz".format(
+            match, index, version))
         trk, y = load_match(match)
         noisy = degrade(trk, profile, seed=index)
         if os.path.isfile(cache):
@@ -113,6 +126,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--quick", action="store_true", help="smaller decoder grid")
     parser.add_argument("--refit", action="store_true", help="ignore cached held-out predictions")
+    parser.add_argument("--stack", action="store_true", help="add the second stage (src/stack.py)")
+    parser.add_argument("--drop", nargs="+", default=[],
+                        help="ablation: drop features whose name starts with any of these; "
+                             "scores only, models/ is left untouched")
     args = parser.parse_args()
     started = time.time()
 
@@ -120,9 +137,16 @@ def main():
     profile = noise_profile(load_metrica())
     print("building degraded external tables")
     tables, labels, blocks, baselines, names = build_tables(profile)
+    if args.drop:
+        keep = [i for i, name in enumerate(names) if not name.startswith(tuple(args.drop))]
+        print("ablation: dropping {} of {} features ({})".format(
+            len(names) - len(keep), len(names), ", ".join(args.drop)))
+        tables = [t[:, keep] for t in tables]
+        names = [names[i] for i in keep]
 
     print("leave-one-match-out fits")
-    held_out_path = os.path.join(CACHE_DIR, "held_out_{}.npz".format(len(names)))
+    held_out_path = os.path.join(CACHE_DIR, "held_out_{}_{}.npz".format(
+        _code_version(), hashlib.sha256((repr(GBM_PARAMS) + repr(names)).encode()).hexdigest()[:6]))
     if os.path.isfile(held_out_path) and not args.refit:
         with np.load(held_out_path) as stored:
             held_out = [(stored["dead_{}".format(i)], stored["home_{}".format(i)])
@@ -138,6 +162,26 @@ def main():
         np.savez(held_out_path, **{"{}_{}".format(kind, i): pair[k]
                                    for i, pair in enumerate(held_out)
                                    for k, kind in enumerate(("dead", "home"))})
+
+    names2, stage_two_tables = None, None
+    if args.stack:
+        # Stage two reads stage one's leave-one-match-out predictions. Its own held-out score
+        # carries a weak optimism: the stage-one predictions it trains on for match j came from
+        # a model that had seen the held-out match's labels. Fine for ranking ideas, which is
+        # what it is used for here.
+        print("stage two on leave-one-match-out stage-one predictions")
+        stacked = [stack_table(p_dead, p_home, x, names)
+                   for (p_dead, p_home), x in zip(held_out, tables)]
+        names2 = stacked[0][1]
+        stage_two_tables = [s for s, _ in stacked]
+        held_out = []
+        for index, match in enumerate(MATCHES):
+            others = [i for i in range(len(MATCHES)) if i != index]
+            model2 = PossessionModel(names2).fit([stage_two_tables[i] for i in others],
+                                                 [labels[i] for i in others])
+            held_out.append(model2.predict(stage_two_tables[index]))
+            print("  {} stage two fitted ({:.0f}s)".format(match, time.time() - started),
+                  flush=True)
 
     grid = dict(GRID)
     if args.quick:
@@ -175,15 +219,23 @@ def main():
     best_spell, best_macro, best, per_match = results[0]
     for match, (s, m) in zip(MATCHES, per_match):
         print("    {}  spellF1 {:.4f}  macroF1 {:.4f}".format(match, s, m))
+    if args.drop:
+        print("ablation run: models/ not written ({:.0f}s total)".format(time.time() - started))
+        return
 
     print("\nfinal fit on all {} matches".format(len(MATCHES)))
     final = PossessionModel(names).fit(tables, labels)
     final.save(os.path.join(MODELS_DIR, "possession_model.pkl"))
+    stage_two_path = os.path.join(MODELS_DIR, "stage_two_model.pkl")
+    if args.stack:
+        PossessionModel(names2).fit(stage_two_tables, labels).save(stage_two_path)
+    elif os.path.isfile(stage_two_path):
+        os.remove(stage_two_path)  # a stale stage two would not match the new stage one
     with open(os.path.join(MODELS_DIR, "decoder.json"), "w") as handle:
-        json.dump({"params": best, "external_spell_f1": best_spell,
-                   "external_macro_f1": best_macro, "matches": list(MATCHES)}, handle, indent=2)
-    print("wrote models/possession_model.pkl and models/decoder.json "
-          "({:.0f}s total)".format(time.time() - started))
+        json.dump({"params": best, "stacked": bool(args.stack),
+                   "external_spell_f1": best_spell, "external_macro_f1": best_macro,
+                   "matches": list(MATCHES)}, handle, indent=2)
+    print("wrote models/ ({:.0f}s total)".format(time.time() - started))
 
 
 if __name__ == "__main__":

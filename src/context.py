@@ -23,6 +23,13 @@ SIDE_WINDOW = 75             # 3 s for the before/after means
 CONTROL_RADIUS = 1.5         # metres
 CONTROL_MARGIN = 1.0         # metres closer than the nearest opponent
 GAP_CAP = 1500               # frames; beyond 60 s "how long ago" stops carrying information
+# Touches. The ATD ball is heavily smoothed (its second differences match a ~17-frame moving mean
+# of DFL tracking), so a kick is spread over most of a second: velocities are compared 6 frames
+# either side rather than frame to frame.
+TOUCH_LAG = 6                # frames
+TOUCH_DV = 3.0               # m/s change of ball velocity that counts as a touch
+TOUCH_RADIUS = 2.5           # metres from the nearest player
+STREAK_CAP = 5               # consecutive same-side touches; the challenge's "two passes" proxy
 
 
 def _shift(values, frames):
@@ -63,6 +70,54 @@ def _edge_features(event, values, prefix, n):
     return {key: value.astype(np.float32) for key, value in out.items()}
 
 
+def touch_features(feats, trk):
+    """Touches: frames where the ball changes velocity sharply next to a player, and whose.
+
+    A touch is a local maximum of |v_after - v_before| above TOUCH_DV with a player within
+    TOUCH_RADIUS; it belongs to the closer side. Possession can only change hands at a touch, so
+    the side of the last and next touch, and how many touches in a row one side has made, are the
+    possession rule written as features.
+    """
+    n, lag, fps = trk.n_frames, TOUCH_LAG, trk.fps
+    out = {}
+    v_before = np.full((n, 2), np.nan, dtype=np.float32)
+    v_after = np.full((n, 2), np.nan, dtype=np.float32)
+    ball = np.column_stack((trk.bx, trk.by))
+    v_before[lag:] = (ball[lag:] - ball[:-lag]) * fps / lag
+    v_after[:-lag] = (ball[lag:] - ball[:-lag]) * fps / lag
+    dv = np.hypot(*(v_after - v_before).T).astype(np.float32)
+    dv[dv > 2 * 40.0] = np.nan  # a jump to a false detection, not a kick
+    out["ball_dv"] = dv
+
+    near = np.fmin(feats["d_home"], feats["d_away"])
+    filled = np.where(np.isnan(dv), -1.0, dv)
+    window = np.lib.stride_tricks.sliding_window_view(
+        np.pad(filled, lag // 2, constant_values=-1.0), lag // 2 * 2 + 1)
+    with np.errstate(invalid="ignore"):
+        peak = (filled >= window.max(axis=1)) & (filled > TOUCH_DV) & (near < TOUCH_RADIUS)
+    side = np.where(feats["d_home"] <= feats["d_away"], 1.0, -1.0).astype(np.float32)
+    touch = np.where(peak, side, 0.0).astype(np.float32)
+    out["touch"] = touch
+    for window_frames in (51, 125):
+        out["touch_balance_{}".format(window_frames)] = _smooth(touch, window_frames) * window_frames
+    out.update(_edge_features(peak, side, "touch", n))
+
+    # Streak of the last touch's side: 1 for a first touch after the other side's, 2 for the
+    # next one by the same side, and so on. Carried forward to every frame until the next touch.
+    frames = np.flatnonzero(peak)
+    streak_at = np.zeros(len(frames), dtype=np.float32)
+    for k in range(len(frames)):
+        same = k > 0 and side[frames[k]] == side[frames[k - 1]]
+        streak_at[k] = min(streak_at[k - 1] + 1, STREAK_CAP) if same else 1
+    streak = np.zeros(n, dtype=np.float32)
+    last = _last_index(peak)
+    has = last >= 0
+    position = np.searchsorted(frames, last[has])
+    streak[has] = streak_at[position] * side[last[has]]
+    out["touch_streak"] = streak
+    return out
+
+
 def context_features(feats, trk):
     n = trk.n_frames
     out = dict(feats)
@@ -92,6 +147,7 @@ def context_features(feats, trk):
     mean_x, mean_y = _smooth(trk.bx, 25), _smooth(trk.by, 25)
     spread = np.hypot(trk.bx - mean_x, trk.by - mean_y)
     out["ball_still"] = _smooth(spread, 25)
+    out.update(touch_features(feats, trk))
     return out
 
 

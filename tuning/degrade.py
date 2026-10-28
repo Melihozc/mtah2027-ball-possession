@@ -7,18 +7,50 @@ pitch. A model fitted on clean data would learn to lean on a ball that BAR-ATH d
 
 The profile below is measured on the BAR-ATH ATD itself -- run lengths of the ball being seen and
 missing, how many players are visible, how often the ball jumps off the pitch. Those are statistics
-of the input, computed by code, with no label involved, which is the line RULES.md draws. Position
-noise is deliberately not added: measured second differences show the ATD is smoother than DFL.
+of the input, computed by code, with no label involved, which is the line RULES.md draws.
+
+Smoothness is matched too, in the other direction: the ATD is far smoother than DFL (second
+differences ~2.5x smaller for the ball, ~10x for players), which flattens exactly the velocity jumps
+a kick produces. So the clean tracks are low-passed with the moving-mean window that brings their
+second differences closest to the ATD's, chosen by measurement rather than set by hand.
 """
 
 import numpy as np
 
+from src.features import _smooth
 from src.tracking import Tracking
 
 # Params
 PLAYER_PRESENT_MEAN_S = 35.0   # median tracklet lifetime in the ATD
 PLAYER_MISSING_MEAN_S = 2.6    # gives ~93% of players visible, as measured (10.2-10.3 of 11)
 OUTLIER_RUN_FRAMES = 10        # false ball detections come in short bursts
+SMOOTH_CANDIDATES = (1, 3, 5, 7, 9, 13, 17, 25)   # moving-mean widths tried, in frames
+
+
+def _second_diff(values, inside):
+    """|x(t+1) - 2 x(t) + x(t-1)| over frames inside a half, flattened, NaN dropped."""
+    d2 = np.abs(values[2:] - 2 * values[1:-1] + values[:-2])
+    d2 = d2[inside[1:-1]]
+    return d2[~np.isnan(d2)]
+
+
+def _smooth_columns(values, width):
+    if width <= 1:
+        return values
+    if values.ndim == 1:
+        return _smooth(values, width)
+    return np.column_stack([_smooth(values[:, k], width) for k in range(values.shape[1])])
+
+
+def _match_width(values, inside, target, stat):
+    """The candidate width whose smoothed second differences have `stat` closest to target."""
+    best, best_gap = 1, np.inf
+    for width in SMOOTH_CANDIDATES:
+        sample = _second_diff(_smooth_columns(values, width), inside)
+        gap = abs(np.log(stat(sample) + 1e-9) - np.log(target + 1e-9))
+        if gap < best_gap:
+            best, best_gap = width, gap
+    return best
 
 
 def _runs(mask):
@@ -38,6 +70,8 @@ def noise_profile(trk):
         "ball_present_runs": np.concatenate([_runs(seen[a:b]) for _, a, b in blocks]),
         "ball_missing_runs": np.concatenate([_runs(~seen[a:b]) for _, a, b in blocks]),
         "ball_outlier_rate": far.sum() / float((seen & inside).sum()),
+        "ball_d2_p90": float(np.percentile(_second_diff(trk.bx, inside), 90)),
+        "player_d2_median": float(np.median(_second_diff(trk.px, inside))),
     }
 
 
@@ -62,8 +96,12 @@ def degrade(trk, profile, seed):
     rng = np.random.default_rng(seed)
     n, n_slots = trk.px.shape
     length, width = trk.pitch
-    px, py = trk.px.copy(), trk.py.copy()
-    bx, by = trk.bx.copy(), trk.by.copy()
+    inside = trk.half > 0
+    ball_width = _match_width(trk.bx, inside, profile["ball_d2_p90"],
+                              lambda s: np.percentile(s, 90))
+    player_width = _match_width(trk.px[:, :4], inside, profile["player_d2_median"], np.median)
+    px, py = _smooth_columns(trk.px, player_width), _smooth_columns(trk.py, player_width)
+    bx, by = _smooth_columns(trk.bx, ball_width), _smooth_columns(trk.by, ball_width)
 
     present, missing = profile["ball_present_runs"], profile["ball_missing_runs"]
     p_seen = present.sum() / float(present.sum() + missing.sum())

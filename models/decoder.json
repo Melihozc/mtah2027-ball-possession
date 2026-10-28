@@ -1,12 +1,13 @@
 {
   "params": {
-    "alpha": 0.5,
+    "alpha": 0.75,
     "restart_cost": 32.0,
     "stop_cost": 32.0,
-    "team_cost": 4.0
+    "team_cost": 2.0
   },
-  "external_spell_f1": 0.5361508347230584,
-  "external_macro_f1": 0.8867354439074691,
+  "stacked": false,
+  "external_spell_f1": 0.5356495420443039,
+  "external_macro_f1": 0.8855876655895086,
   "matches": [
     "J03WMX",
     "J03WN1",
